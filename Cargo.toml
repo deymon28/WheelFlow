@@ -1,0 +1,15 @@
+[package]
+name = "wheelflow"
+version = "0.5.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "WheelFlow"
+path = "native/main.rs"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
