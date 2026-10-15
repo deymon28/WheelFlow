@@ -9,6 +9,7 @@
 - Embedded executable resources: icon, version information, and an application manifest (themed Windows controls, per-monitor DPI awareness, Windows 10/11 compatibility).
 - Launching WheelFlow while it is already running opens the running instance's settings instead of showing an error. Automatic starts exit quietly when an instance is already running.
 - GitHub Actions workflows: formatting, unit tests, and release build on every push, plus a release workflow that attaches `WheelFlow.exe` to version tags.
+- MIT license.
 
 ### Fixed
 

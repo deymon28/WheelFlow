@@ -3,6 +3,7 @@ name = "wheelflow"
 version = "0.6.0"
 edition = "2021"
 publish = false
+license = "MIT"
 
 [[bin]]
 name = "WheelFlow"

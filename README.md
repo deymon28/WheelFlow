@@ -69,3 +69,7 @@ The hook callback performs no process lookup, file IO, blocking lock acquisition
 ## Limits
 
 Explorer and some other Windows controls still move in whole lines; WheelFlow makes those steps smaller but cannot make them pixel-smooth. Applications that treat every wheel message as a full notch regardless of its size should be added to the exclusions. Killing WheelFlow while it hovers Explorer leaves the session at one line per notch until WheelFlow starts again or the user signs out. See [design notes](docs/design.md) for the motion model, frame timing, compatibility decisions, and invariants.
+
+## License
+
+WheelFlow is released under the [MIT License](LICENSE).
