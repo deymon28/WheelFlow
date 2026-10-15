@@ -1,5 +1,6 @@
 use crate::config::{Config, DURATION, SPEED};
 use crate::win::{self, GetLastError};
+use crate::{icon, startup};
 use std::{
     cell::RefCell,
     ffi::c_void,
@@ -129,6 +130,9 @@ unsafe extern "system" {
         cy: i32,
         flags: u32,
     ) -> i32;
+    fn CreateIconIndirect(info: *const IconInfo) -> Handle;
+    fn DestroyIcon(icon: Handle) -> i32;
+    fn GetSystemMetricsForDpi(index: i32, dpi: u32) -> i32;
 }
 #[link(name = "shell32")]
 unsafe extern "system" {
@@ -153,9 +157,50 @@ unsafe extern "system" {
         face: *const u16,
     ) -> Handle;
     fn DeleteObject(object: Handle) -> i32;
+    fn CreateDIBSection(
+        dc: Handle,
+        info: *const BitmapInfoHeader,
+        usage: u32,
+        bits: *mut *mut c_void,
+        section: Handle,
+        offset: u32,
+    ) -> Handle;
+    fn CreateBitmap(
+        width: i32,
+        height: i32,
+        planes: u32,
+        bit_count: u32,
+        bits: *const c_void,
+    ) -> Handle;
+}
+
+#[repr(C)]
+struct IconInfo {
+    icon: i32,
+    hotspot_x: u32,
+    hotspot_y: u32,
+    mask: Handle,
+    color: Handle,
+}
+#[repr(C)]
+#[derive(Default)]
+struct BitmapInfoHeader {
+    size: u32,
+    width: i32,
+    height: i32,
+    planes: u16,
+    bit_count: u16,
+    compression: u32,
+    size_image: u32,
+    x_pixels_per_meter: i32,
+    y_pixels_per_meter: i32,
+    colors_used: u32,
+    colors_important: u32,
 }
 
 const TRAY_MESSAGE: u32 = 0x8001;
+/// Posted by a second launch so the running instance opens its settings.
+pub const SHOW_SETTINGS_MESSAGE: u32 = 0x8002;
 const ENABLED: usize = 101;
 const SETTINGS: usize = 102;
 const DIAGNOSTICS: usize = 103;
@@ -172,8 +217,11 @@ struct State {
     acceleration: Handle,
     fullscreen: Handle,
     administrator: Handle,
+    autostart: Handle,
     exclusions: Handle,
     font: Handle,
+    // Tray icons for the enabled and paused states.
+    icons: [Handle; 2],
     controls: Vec<Handle>,
     config: Config,
     update: Rc<dyn Fn(Config)>,
@@ -211,32 +259,85 @@ fn icon_data(window: Handle) -> NotifyIconData {
     data.id = 1;
     data.flags = 1 | 2 | 4;
     data.callback = TRAY_MESSAGE;
-    data.icon = unsafe { LoadIconW(null_mut(), 32512usize as *const u16) };
-    let enabled = STATE.with(|s| {
+    let (enabled, icons) = STATE.with(|s| {
         s.borrow()
             .as_ref()
-            .map(|s| s.config.enabled)
-            .unwrap_or(true)
+            .map(|s| (s.config.enabled, s.icons))
+            .unwrap_or((true, [null_mut(); 2]))
     });
-    let tip = wide(if enabled {
-        "WheelFlow - enabled"
-    } else {
-        "WheelFlow - paused"
-    });
+    data.icon = icons[!enabled as usize];
+    if data.icon.is_null() {
+        data.icon = unsafe { LoadIconW(null_mut(), 32512usize as *const u16) };
+    }
+    let tip = wide(&format!(
+        "WheelFlow - {}{}",
+        if enabled { "enabled" } else { "paused" },
+        if win::running_elevated() {
+            " (administrator)"
+        } else {
+            ""
+        }
+    ));
     data.tip[..tip.len()].copy_from_slice(&tip);
     data
 }
 
+/// Builds an icon from WheelFlow's procedural artwork at the given pixel size.
+fn create_icon(size: u32, look: icon::Look) -> Handle {
+    let pixels = icon::render(size, look);
+    unsafe {
+        let header = BitmapInfoHeader {
+            size: size_of::<BitmapInfoHeader>() as u32,
+            width: size as i32,
+            height: -(size as i32), // Top-down rows, matching `render`.
+            planes: 1,
+            bit_count: 32,
+            ..Default::default()
+        };
+        let mut bits: *mut c_void = null_mut();
+        let color = CreateDIBSection(null_mut(), &header, 0, &mut bits, null_mut(), 0);
+        if color.is_null() || bits.is_null() {
+            return null_mut();
+        }
+        std::ptr::copy_nonoverlapping(pixels.as_ptr(), bits.cast::<u8>(), pixels.len());
+        // With a 32-bit colour bitmap the alpha channel defines transparency;
+        // the monochrome mask only has to exist.
+        let mask = CreateBitmap(size as i32, size as i32, 1, 1, null());
+        let info = IconInfo {
+            icon: 1,
+            hotspot_x: 0,
+            hotspot_y: 0,
+            mask,
+            color,
+        };
+        let handle = if mask.is_null() {
+            null_mut()
+        } else {
+            CreateIconIndirect(&info)
+        };
+        DeleteObject(color);
+        if !mask.is_null() {
+            DeleteObject(mask);
+        }
+        handle
+    }
+}
+
 fn publish_config(config: Config) {
-    let (update, owner) = STATE.with(|s| {
+    let (update, owner, previous) = STATE.with(|s| {
         let mut state = s.borrow_mut();
         let state = state.as_mut().unwrap();
-        state.config = config.clone();
-        (state.update.clone(), state.owner)
+        let previous = std::mem::replace(&mut state.config, config.clone());
+        (state.update.clone(), state.owner, previous)
     });
     update(config.clone());
     if let Err(error) = config.save() {
         message_box(owner, &error, true);
+    }
+    if previous.autostart != config.autostart || previous.run_as_admin != config.run_as_admin {
+        if let Err(error) = startup::sync(&config) {
+            message_box(owner, &error, true);
+        }
     }
     unsafe {
         Shell_NotifyIconW(1, &icon_data(owner));
@@ -324,6 +425,10 @@ unsafe extern "system" fn owner_proc(
             }
             0
         }
+        SHOW_SETTINGS_MESSAGE => {
+            action(SETTINGS);
+            0
+        }
         0x10 => {
             let settings = STATE.with(|s| {
                 s.borrow()
@@ -363,20 +468,24 @@ fn checked(control: Handle) -> bool {
 }
 
 fn save_settings(window: Handle) {
-    let (speed, duration, acceleration, fullscreen, administrator, exclusions, mut config) = STATE
-        .with(|s| {
-            let state = s.borrow();
-            let state = state.as_ref().unwrap();
-            (
+    let (controls, mut config) = STATE.with(|s| {
+        let state = s.borrow();
+        let state = state.as_ref().unwrap();
+        (
+            [
                 state.speed,
                 state.duration,
                 state.acceleration,
                 state.fullscreen,
                 state.administrator,
+                state.autostart,
                 state.exclusions,
-                state.config.clone(),
-            )
-        });
+            ],
+            state.config.clone(),
+        )
+    });
+    let [speed, duration, acceleration, fullscreen, administrator, autostart, exclusions] =
+        controls;
     let speed_value = control_text(speed).trim().parse::<u32>();
     let duration_value = control_text(duration).trim().parse::<u32>();
     match (speed_value, duration_value) {
@@ -388,6 +497,7 @@ fn save_settings(window: Handle) {
             let elevate =
                 checked(administrator) && !config.run_as_admin && !win::running_elevated();
             config.run_as_admin = checked(administrator);
+            config.autostart = checked(autostart);
             config.exclusions = Config::exclusion_names(&control_text(exclusions));
             publish_config(config);
             unsafe {
@@ -515,10 +625,11 @@ fn layout_settings(window: Handle) {
         (20, 98, 335, 24),
         (20, 126, 335, 24),
         (20, 154, 335, 40),
-        (20, 200, 335, 40),
-        (20, 242, 335, 110),
-        (195, 368, 75, 30),
-        (280, 368, 75, 30),
+        (20, 198, 335, 24),
+        (20, 232, 335, 40),
+        (20, 274, 335, 100),
+        (195, 390, 75, 30),
+        (280, 390, 75, 30),
     ];
     for (control, (x, y, w, h)) in controls.into_iter().zip(positions) {
         unsafe {
@@ -584,7 +695,7 @@ fn show_settings() -> Result<(), String> {
             left: 0,
             top: 0,
             right: (375 * dpi / 96) as i32,
-            bottom: (418 * dpi / 96) as i32,
+            bottom: (440 * dpi / 96) as i32,
         };
         AdjustWindowRectExForDpi(&mut rect, SETTINGS_STYLE, 0, 0x10000, dpi);
         SetWindowPos(
@@ -630,6 +741,7 @@ fn show_settings() -> Result<(), String> {
                 0x10000 | 3 | 0x2000,
                 206,
             ),
+            ("BUTTON", "Start with Windows".to_owned(), 0x10000 | 3, 207),
             (
                 "STATIC",
                 "Excluded apps (one per line, e.g. game.exe)".to_owned(),
@@ -675,7 +787,8 @@ fn show_settings() -> Result<(), String> {
             state.acceleration = controls[4];
             state.fullscreen = controls[5];
             state.administrator = controls[6];
-            state.exclusions = controls[8];
+            state.autostart = controls[7];
+            state.exclusions = controls[9];
             state.controls = controls;
         });
         for (control, value) in [
@@ -690,6 +803,10 @@ fn show_settings() -> Result<(), String> {
             (
                 STATE.with(|s| s.borrow().as_ref().unwrap().administrator),
                 config.run_as_admin,
+            ),
+            (
+                STATE.with(|s| s.borrow().as_ref().unwrap().autostart),
+                config.autostart,
             ),
         ] {
             SendMessageW(control, 0xF1, value as usize, 0);
@@ -732,6 +849,11 @@ pub fn run(
         let instance = module_handle();
         let owner_name = wide("WheelFlowTray");
         let settings_name = wide("WheelFlowSettings");
+        // The executable's icon group (resource 1), with the stock icon as fallback.
+        let mut application_icon = LoadIconW(instance, 1usize as *const u16);
+        if application_icon.is_null() {
+            application_icon = LoadIconW(null_mut(), 32512usize as *const u16);
+        }
         for (name, proc) in [
             (&owner_name, owner_proc as WindowProc),
             (&settings_name, settings_proc as WindowProc),
@@ -743,7 +865,7 @@ pub fn run(
                 class_extra: 0,
                 window_extra: 0,
                 instance,
-                icon: LoadIconW(null_mut(), 32512usize as *const u16),
+                icon: application_icon,
                 cursor: LoadCursorW(null_mut(), 32512usize as *const u16),
                 background: 16usize as Handle,
                 menu_name: null(),
@@ -789,8 +911,18 @@ pub fn run(
                 acceleration: null_mut(),
                 fullscreen: null_mut(),
                 administrator: null_mut(),
+                autostart: null_mut(),
                 exclusions: null_mut(),
                 font: null_mut(),
+                icons: {
+                    // The hidden owner window follows the system DPI, like the tray.
+                    let size =
+                        GetSystemMetricsForDpi(49, GetDpiForWindow(owner).max(96)).max(16) as u32;
+                    [
+                        create_icon(size, icon::Look::Enabled),
+                        create_icon(size, icon::Look::Paused),
+                    ]
+                },
                 controls: Vec::new(),
                 config,
                 update: Rc::from(update),
@@ -800,7 +932,10 @@ pub fn run(
             })
         });
         // Allow `--stop` from a non-elevated shell to close an elevated instance.
-        win::ChangeWindowMessageFilterEx(owner as win::Handle, 0x10, 1, null_mut());
+        // A second launch asks this instance to show its settings.
+        for allowed in [0x10, SHOW_SETTINGS_MESSAGE] {
+            win::ChangeWindowMessageFilterEx(owner as win::Handle, allowed, 1, null_mut());
+        }
         if Shell_NotifyIconW(0, &icon_data(owner)) == 0 {
             DestroyWindow(owner);
             STATE.with(|s| *s.borrow_mut() = None);
@@ -830,7 +965,11 @@ pub fn run(
         if result.is_err() {
             SendMessageW(owner, 0x10, 0, 0);
         }
-        STATE.with(|s| *s.borrow_mut() = None);
+        if let Some(state) = STATE.with(|s| s.borrow_mut().take()) {
+            for icon in state.icons.into_iter().filter(|i| !i.is_null()) {
+                DestroyIcon(icon);
+            }
+        }
         UnregisterClassW(settings_name.as_ptr(), instance);
         UnregisterClassW(owner_name.as_ptr(), instance);
         result
@@ -845,6 +984,8 @@ mod tests {
     fn windows_x64_abi_layouts_match_sdk() {
         assert_eq!(size_of::<Handle>(), 8);
         assert_eq!(size_of::<WindowClass>(), 80);
+        assert_eq!(size_of::<IconInfo>(), 32);
+        assert_eq!(size_of::<BitmapInfoHeader>(), 40);
         assert_eq!(size_of::<Message>(), 48);
         assert_eq!(size_of::<NotifyIconData>(), 976);
     }

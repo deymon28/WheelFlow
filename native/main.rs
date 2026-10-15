@@ -2,7 +2,9 @@
 mod clock;
 mod config;
 mod engine;
+mod icon;
 mod runtime;
+mod startup;
 mod ui;
 mod verify;
 mod win;
@@ -43,6 +45,7 @@ fn main() {
         return;
     }
     let restarted = args.iter().any(|a| a == "--restarted");
+    let automatic = args.iter().any(|a| a == startup::ARGUMENT);
     let config = config::Config::load();
     // An administrator preference asks for elevation once per start; a
     // declined prompt continues without it.
@@ -84,8 +87,21 @@ fn main() {
         return;
     }
     if mutex == -1 {
-        show_error("WheelFlow is already running. Open its tray icon.");
+        // An automatic start beside a running instance exits quietly; a manual
+        // launch brings up the running instance's settings instead.
+        if !automatic && !show_running_settings() {
+            show_error("WheelFlow is already running. Open its tray icon.");
+        }
         return;
+    }
+    // Keep the startup registration current (for example after the program
+    // moved, or once an elevated start can register or remove the
+    // administrator task). A normal instance without autostart leaves it alone.
+    if config.autostart || win::running_elevated() {
+        let registration = config.clone();
+        std::thread::spawn(move || {
+            let _ = startup::sync(&registration);
+        });
     }
     let result = run(config);
     unsafe {
@@ -107,6 +123,22 @@ fn run(config: config::Config) -> Result<(), String> {
     );
     runtime.stop();
     result
+}
+
+fn show_running_settings() -> bool {
+    unsafe {
+        let window = win::FindWindowW(
+            win::wide("WheelFlowTray").as_ptr(),
+            win::wide("WheelFlow").as_ptr(),
+        );
+        if window == 0 {
+            return false;
+        }
+        // This process was just started by the user, so it may hand the
+        // foreground to the running instance's settings window.
+        win::AllowSetForegroundWindow(win::process_id(window));
+        win::PostMessageW(window, ui::SHOW_SETTINGS_MESSAGE, 0, 0) != 0
+    }
 }
 
 fn show_error(error: &str) {

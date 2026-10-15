@@ -255,13 +255,34 @@ pub fn elevated(process: Handle) -> Option<bool> {
 pub fn running_elevated() -> bool {
     elevated(unsafe { GetCurrentProcess() }).unwrap_or(false)
 }
+/// Whether the foreground window belongs to an elevated process. Windows does
+/// not pass its input to the low-level hooks of a non-elevated process.
+pub fn foreground_elevated() -> bool {
+    unsafe {
+        let window = GetForegroundWindow();
+        if window == 0 {
+            return false;
+        }
+        let process = OpenProcess(0x1000, 0, process_id(window));
+        if process == 0 {
+            return false;
+        }
+        let result = elevated(process).unwrap_or(false);
+        CloseHandle(process);
+        result
+    }
+}
+pub fn executable_path() -> Option<String> {
+    let mut path = vec![0u16; 32768];
+    let length = unsafe { GetModuleFileNameW(0, path.as_mut_ptr(), path.len() as u32) } as usize;
+    (length > 0 && length < path.len()).then(|| String::from_utf16_lossy(&path[..length]))
+}
 /// Starts this executable again with a UAC elevation prompt.
 pub fn relaunch_elevated(arguments: &str) -> bool {
-    let mut path = [0u16; 1024];
-    let length = unsafe { GetModuleFileNameW(0, path.as_mut_ptr(), path.len() as u32) };
-    if length == 0 || length as usize >= path.len() {
+    let Some(executable) = executable_path() else {
         return false;
-    }
+    };
+    let path = wide(&executable);
     let verb = wide("runas");
     let parameters = wide(arguments);
     let mut info = ShellExecuteInfo {
@@ -340,14 +361,22 @@ pub fn set_wheel_scroll_lines(lines: u32) -> bool {
 }
 /// The user's saved WheelScrollLines preference.
 pub fn saved_wheel_scroll_lines() -> Option<u32> {
-    let mut buffer = [0u16; 16];
-    let mut size = std::mem::size_of_val(&buffer) as u32;
+    get_user_value("Control Panel\\Desktop", "WheelScrollLines")?
+        .trim()
+        .parse()
+        .ok()
+}
+const CURRENT_USER: Handle = 0x80000001u32 as i32 as isize;
+/// Reads a string value under HKEY_CURRENT_USER.
+pub fn get_user_value(subkey: &str, name: &str) -> Option<String> {
+    let mut buffer = vec![0u16; 1024];
+    let mut size = (buffer.len() * 2) as u32;
     let status = unsafe {
         RegGetValueW(
-            0x80000001u32 as i32 as isize,
-            wide("Control Panel\\Desktop").as_ptr(),
-            wide("WheelScrollLines").as_ptr(),
-            0x2,
+            CURRENT_USER,
+            wide(subkey).as_ptr(),
+            wide(name).as_ptr(),
+            0x2, // RRF_RT_REG_SZ
             std::ptr::null_mut(),
             buffer.as_mut_ptr().cast(),
             &mut size,
@@ -356,8 +385,28 @@ pub fn saved_wheel_scroll_lines() -> Option<u32> {
     if status != 0 {
         return None;
     }
-    let text = String::from_utf16_lossy(&buffer[..(size as usize / 2).saturating_sub(1)]);
-    text.trim().parse().ok()
+    buffer.truncate((size as usize / 2).saturating_sub(1));
+    Some(String::from_utf16_lossy(&buffer))
+}
+/// Writes a string value under HKEY_CURRENT_USER, creating the key if needed.
+pub fn set_user_value(subkey: &str, name: &str, value: &str) -> bool {
+    let data = wide(value);
+    unsafe {
+        RegSetKeyValueW(
+            CURRENT_USER,
+            wide(subkey).as_ptr(),
+            wide(name).as_ptr(),
+            1, // REG_SZ
+            data.as_ptr().cast(),
+            (data.len() * 2) as u32,
+        ) == 0
+    }
+}
+/// Removes a value under HKEY_CURRENT_USER; a missing value is not an error.
+pub fn delete_user_value(subkey: &str, name: &str) {
+    unsafe {
+        RegDeleteKeyValueW(CURRENT_USER, wide(subkey).as_ptr(), wide(name).as_ptr());
+    }
 }
 pub fn set_thread_priority(priority: i32) {
     unsafe {
@@ -408,6 +457,7 @@ extern "system" {
     pub fn SetTimer(window: Handle, id: usize, milliseconds: u32, callback: *const c_void)
         -> usize;
     pub fn MonitorFromPoint(point: Point, flags: u32) -> Handle;
+    pub fn AllowSetForegroundWindow(process: u32) -> i32;
     pub fn EnumDisplayMonitors(
         dc: Handle,
         clip: *const Rect,
@@ -498,6 +548,16 @@ extern "system" {
         size: u32,
         returned: *mut u32,
     ) -> i32;
+    pub fn RegSetKeyValueW(
+        key: Handle,
+        subkey: *const u16,
+        value: *const u16,
+        kind: u32,
+        data: *const c_void,
+        size: u32,
+    ) -> i32;
+    pub fn RegDeleteKeyValueW(key: Handle, subkey: *const u16, value: *const u16) -> i32;
+    pub fn RegDeleteTreeW(key: Handle, subkey: *const u16) -> i32;
     pub fn RegGetValueW(
         key: Handle,
         subkey: *const u16,
@@ -530,12 +590,44 @@ mod tests {
     #[test]
     fn reads_session_and_saved_wheel_lines_without_changing_them() {
         let session = wheel_scroll_lines().expect("session wheel lines");
-        let saved = saved_wheel_scroll_lines().expect("saved wheel lines");
-        assert!(session >= 1 && saved >= 1);
+        assert!(session >= 1);
         assert_eq!(wheel_scroll_lines(), Some(session));
-        let primary = monitor_of(0);
-        assert!(monitors().contains(&primary));
-        let rate = monitor_device(primary).as_ref().and_then(refresh_rate);
-        assert!(rate.map(|hz| hz >= 24).unwrap_or(false), "{rate:?}");
+        // A fresh profile (for example on a build server) may not store the value.
+        if let Some(saved) = saved_wheel_scroll_lines() {
+            assert!(saved >= 1);
+        }
+    }
+
+    #[test]
+    fn user_values_round_trip_and_delete() {
+        let key = format!("Software\\WheelFlow.Test.{}", std::process::id());
+        let command = r#""C:\Tools\WheelFlow.exe" --autostart"#;
+        assert!(set_user_value(&key, "Command", command));
+        assert_eq!(get_user_value(&key, "Command").as_deref(), Some(command));
+        delete_user_value(&key, "Command");
+        assert_eq!(get_user_value(&key, "Command"), None);
+        delete_user_value(&key, "Command");
+        unsafe {
+            RegDeleteTreeW(CURRENT_USER, wide(&key).as_ptr());
+        }
+        assert!(executable_path()
+            .map(|p| p.to_lowercase().ends_with(".exe"))
+            .unwrap_or(false));
+    }
+
+    #[test]
+    fn monitors_report_their_refresh_rates() {
+        let screens = monitors();
+        // Headless sessions may have no display at all.
+        if screens.is_empty() {
+            return;
+        }
+        assert!(screens.contains(&monitor_of(0)));
+        for monitor in screens {
+            let device = monitor_device(monitor).expect("monitor device name");
+            if let Some(hz) = refresh_rate(&device) {
+                assert!(hz >= 24, "{hz}");
+            }
+        }
     }
 }

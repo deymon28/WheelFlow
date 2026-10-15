@@ -22,7 +22,10 @@ static SHARED: OnceLock<Arc<Shared>> = OnceLock::new();
 const POLICY_LIFETIME_MS: f64 = 30000.0;
 const POLICY_REFRESH_MS: f64 = 5000.0;
 const PREFETCH_INTERVAL_US: u64 = 25000;
-const WATCHDOG_MS: u32 = 2000;
+// The hook thread's timer settles the hover state after the pointer stops
+// (movement handling is throttled) and runs the hook watchdog every 2 s.
+const TICK_MS: u32 = 100;
+const WATCHDOG_TICKS: u32 = 20;
 // Windows controls whose fullscreen mode is still a document, not a game.
 const FULLSCREEN_DOCUMENTS: [&str; 7] = [
     "Chrome_WidgetWin_0",
@@ -434,15 +437,24 @@ fn hook_loop(state: Arc<Shared>, ready: mpsc::Sender<Result<(), String>>) {
         state.stats.installed.fetch_add(1, Ordering::Relaxed);
         let _ = ready.send(Ok(()));
         if !state.verifying {
-            SetTimer(0, 0, WATCHDOG_MS, null());
+            SetTimer(0, 0, TICK_MS, null());
         }
         let mut last_point = Point::default();
         GetPhysicalCursorPos(&mut last_point);
         let mut last_seen = state.hook_events.load(Ordering::Relaxed);
+        let mut ticks = 0u32;
+        let mut last_logged: Option<f64> = None;
         while GetMessageW(&mut message, 0, 0, 0) > 0 {
+            if message.message == WM_TIMER {
+                let mut point = Point::default();
+                if GetPhysicalCursorPos(&mut point) != 0 {
+                    classify(&state, point, state.now_us());
+                }
+                ticks += 1;
+            }
             let reinstall = match message.message {
                 WM_REHOOK => true,
-                WM_TIMER => {
+                WM_TIMER if ticks % WATCHDOG_TICKS == 0 => {
                     // Windows silently removes a low-level hook that once exceeded
                     // LowLevelHooksTimeout. If the pointer moved but the hook saw
                     // nothing, reinstall it instead of staying unsmoothed.
@@ -450,12 +462,21 @@ fn hook_loop(state: Arc<Shared>, ready: mpsc::Sender<Result<(), String>>) {
                     let mut point = Point::default();
                     let moved = GetPhysicalCursorPos(&mut point) != 0
                         && (point.x, point.y) != (last_point.x, last_point.y);
-                    let lost = moved && seen == last_seen;
+                    // Input to an elevated foreground window never reaches a
+                    // non-elevated hook; that silence is expected, not a loss.
+                    let lost = moved
+                        && seen == last_seen
+                        && (running_elevated() || !foreground_elevated());
                     last_point = point;
                     last_seen = seen;
                     if lost {
                         state.stats.watchdog.fetch_add(1, Ordering::Relaxed);
-                        state.log("mouse hook stopped receiving input; reinstalling");
+                        // Bounded log: at most one line per minute.
+                        let now = state.now();
+                        if last_logged.map(|at| now - at >= 60000.0).unwrap_or(true) {
+                            last_logged = Some(now);
+                            state.log("mouse hook stopped receiving input; reinstalling");
+                        }
                     }
                     lost
                 }
@@ -524,6 +545,15 @@ fn prefetch(state: &Shared, point: Point) {
         return;
     }
     state.prefetch_at.store(now, Ordering::Relaxed);
+    classify(state, point, now);
+}
+
+// Requests classification of the window at `point` when needed, and reports
+// hover changes so per-window system adjustments follow the pointer.
+fn classify(state: &Shared, point: Point, now: u64) {
+    if !state.enabled.load(Ordering::Relaxed) {
+        return;
+    }
     let root = root_at(point);
     if root == 0 {
         return;
@@ -547,10 +577,12 @@ fn prefetch(state: &Shared, point: Point) {
     if !fresh {
         state.request(root, pid);
     }
-    // Report hover changes so per-window system adjustments follow the pointer.
-    if state.hovered.swap(root, Ordering::Relaxed) != root
+    // Record the hover only once the worker has been told, so a full queue
+    // is retried on the next movement or tick instead of being forgotten.
+    if state.hovered.load(Ordering::Relaxed) != root
         && state.sender.try_send(Command::Hover(root)).is_ok()
     {
+        state.hovered.store(root, Ordering::Relaxed);
         state.notify();
     }
 }
@@ -744,6 +776,23 @@ fn deliver(state: &Shared, motion: &mut Motion, delta: i32, horizontal: bool) ->
     true
 }
 
+/// Decrements a positive counter; true when one unit was taken.
+fn take_one(counter: &AtomicU32) -> bool {
+    let mut current = counter.load(Ordering::Relaxed);
+    while current > 0 {
+        match counter.compare_exchange_weak(
+            current,
+            current - 1,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return true,
+            Err(actual) => current = actual,
+        }
+    }
+    false
+}
+
 fn deliver_piece(state: &Shared, motion: &mut Motion, delta: i32, horizontal: bool) -> bool {
     if delta == 0 {
         return true;
@@ -756,17 +805,7 @@ fn deliver_piece(state: &Shared, motion: &mut Motion, delta: i32, horizontal: bo
         motion.clear();
         return false;
     }
-    let simulate_failure = state.verifying
-        && state
-            .test_fail_next
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                if n > 0 {
-                    Some(n - 1)
-                } else {
-                    None
-                }
-            })
-            .is_ok();
+    let simulate_failure = state.verifying && take_one(&state.test_fail_next);
     let input = wheel_input(
         delta,
         horizontal,

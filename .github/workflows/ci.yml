@@ -1,0 +1,25 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check formatting
+        run: cargo fmt --check
+      - name: Unit tests
+        run: cargo test --locked
+      - name: Release build
+        run: cargo build --release --locked
+      - uses: actions/upload-artifact@v4
+        with:
+          name: WheelFlow
+          path: target/release/WheelFlow.exe

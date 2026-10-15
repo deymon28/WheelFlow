@@ -5,9 +5,9 @@ This document records the decisions behind WheelFlow's input pipeline, motion mo
 ## Input pipeline
 
 - **Hook thread.** A low-level mouse hook runs on its own message-loop thread at raised priority. Windows silently removes a low-level hook whose callback exceeds `LowLevelHooksTimeout`, so the callback does no process lookup, file IO, UI work, blocking lock acquisition, or input injection. It reads a cached per-window policy with `try_read` and hands accepted wheel events to the worker through a bounded `try_send` queue. If the queue is full, the event passes through natively.
-- **Policy prefetch.** On pointer movement, at most every 25 ms, the hook finds the top-level window under the pointer and asks the worker to classify it if its policy is missing or ageing. The first wheel event over a new window is therefore usually smoothed. Unknown windows keep native input until classified; ageing verdicts stay valid while they refresh.
+- **Policy prefetch.** On pointer movement, at most every 25 ms, the hook finds the top-level window under the pointer and asks the worker to classify it if its policy is missing or ageing. The first wheel event over a new window is therefore usually smoothed. Unknown windows keep native input until classified; ageing verdicts stay valid while they refresh. Because movement handling is throttled, a 100 ms tick on the hook thread repeats the check after the pointer stops. A hover change is recorded only after the worker has accepted it, so a full queue cannot lose it.
 - **Policies.** The worker resolves eligibility: excluded process names, integrity level (a non-elevated process cannot inject into elevated windows), fullscreen documents versus games, and Explorer item views. A rejected injection bypasses only that window for two seconds.
-- **Watchdog.** Every two seconds, the hook thread checks whether the pointer moved while the hook saw no mouse events. If so, it reinstalls the hook.
+- **Watchdog.** Every two seconds, the hook thread checks whether the pointer moved while the hook saw no mouse events. If so, it reinstalls the hook. A non-elevated hook never receives input while an elevated window is in the foreground, so that silence is not counted. Log lines are limited to one per minute.
 - **Cancellation.** Reversal, modifiers, target changes, and disabling increment an epoch. Queued events from an older epoch are discarded, and every output piece rechecks the epoch, modifiers, and target before it is sent.
 
 ## Motion model
@@ -44,6 +44,15 @@ The hook, vertical-blank, and output threads use raised thread priorities, and t
 - **Fullscreen.** When the pointer is confined, or the target is a captionless, non-maximized top-level window covering its monitor, input passes through unchanged. Browsers, UWP frames, Explorer, and the desktop are excepted. Games often read smoothed output through raw input as many separate notches.
 - **Elevation.** Windows rejects input injected into higher-integrity windows. The optional administrator mode relaunches WheelFlow through `ShellExecuteEx` with the `runas` verb. The new instance waits up to five seconds for the previous one to release the single-instance mutex. An elevated instance accepts `WM_CLOSE` from lower integrity so `--stop` keeps working.
 - **Large outputs.** Wheel messages carry signed 16-bit deltas, so large overdue frames are split into pieces of at most 32767 units.
+
+## Startup, instances, and resources
+
+- **Single instance.** A session-local mutex guards the tray instance. A manual second launch posts a message asking the running instance to show its settings, and grants it the foreground first. A start with `--autostart` exits quietly. An instance restarted for elevation waits up to five seconds for the previous one to exit.
+- **Start with Windows.** A normal instance writes `"<exe>" --autostart` to the per-user Run key. When administrator mode is also enabled, an elevated instance registers a Task Scheduler logon task instead (`schtasks /Create /XML`) and removes the Run value. The task uses the highest available run level, normal priority (4), no execution time limit, and no battery stop. A normal instance cannot create or delete that task, so it writes the Run value until the next elevated start replaces it. The registration is refreshed at startup when autostart is on or the instance is elevated, which also corrects a moved executable.
+- **Resources.** `build.rs` writes a `.res` file directly and passes it to the MSVC linker, so no resource compiler or crate is needed. The file contains:
+  - an icon group in eight sizes, drawn by `native/icon.rs`, which also draws the enabled and paused tray icons at run time;
+  - version information;
+  - a manifest that enables Common Controls 6 (themed settings controls), per-monitor DPI awareness v2, Windows 10/11 compatibility, and `asInvoker` execution.
 
 ## Verification
 

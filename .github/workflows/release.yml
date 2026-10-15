@@ -1,0 +1,29 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Unit tests
+        run: cargo test --locked
+      - name: Release build
+        run: cargo build --release --locked
+      - name: Publish release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $version = '${{ github.ref_name }}'.TrimStart('v')
+          $changelog = Get-Content CHANGELOG.md -Raw
+          $pattern = "(?ms)^## \[$([regex]::Escape($version))\][^\n]*\n(.*?)(?=^## \[|\z)"
+          $notes = if ($changelog -match $pattern) { $Matches[1].Trim() } else { 'See CHANGELOG.md.' }
+          Set-Content -Path notes.md -Value $notes -Encoding utf8
+          gh release create '${{ github.ref_name }}' target/release/WheelFlow.exe --title "WheelFlow $version" --notes-file notes.md

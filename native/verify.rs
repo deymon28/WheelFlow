@@ -258,6 +258,7 @@ fn exercise(observed: &Observation) -> Result<String, String> {
         acceleration: false,
         fullscreen_bypass: true,
         run_as_admin: false,
+        autostart: false,
         exclusions: Vec::new(),
     };
     let mut runtime = Runtime::start(config.clone(), true)?;

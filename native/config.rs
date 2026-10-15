@@ -8,6 +8,7 @@ pub struct Config {
     pub acceleration: bool,
     pub fullscreen_bypass: bool,
     pub run_as_admin: bool,
+    pub autostart: bool,
     pub exclusions: Vec<String>,
 }
 
@@ -23,6 +24,7 @@ impl Default for Config {
             acceleration: true,
             fullscreen_bypass: true,
             run_as_admin: false,
+            autostart: false,
             exclusions: Vec::new(),
         }
     }
@@ -65,6 +67,7 @@ impl Config {
                 "acceleration" => result.acceleration = value != "false",
                 "fullscreen_bypass" => result.fullscreen_bypass = value != "false",
                 "run_as_admin" => result.run_as_admin = value == "true",
+                "autostart" => result.autostart = value == "true",
                 "exclude" => result.exclusions = Self::exclusion_names(value),
                 _ => (),
             }
@@ -91,13 +94,14 @@ impl Config {
 
     fn serialize(&self) -> String {
         format!(
-            "speed={}\nduration={}\nenabled={}\nacceleration={}\nfullscreen_bypass={}\nrun_as_admin={}\nexclude={}\n",
+            "speed={}\nduration={}\nenabled={}\nacceleration={}\nfullscreen_bypass={}\nrun_as_admin={}\nautostart={}\nexclude={}\n",
             self.speed.clamp(*SPEED.start(), *SPEED.end()),
             self.duration.clamp(*DURATION.start(), *DURATION.end()),
             self.enabled,
             self.acceleration,
             self.fullscreen_bypass,
             self.run_as_admin,
+            self.autostart,
             Self::exclusion_names(&self.exclusions.join(",")).join(",")
         )
     }
@@ -142,7 +146,10 @@ mod tests {
         assert!(legacy.acceleration && legacy.fullscreen_bypass && !legacy.run_as_admin);
         let mut admin = Config::default();
         admin.run_as_admin = true;
-        assert!(Config::parse(&admin.serialize()).run_as_admin);
+        admin.autostart = true;
+        let parsed = Config::parse(&admin.serialize());
+        assert!(parsed.run_as_admin && parsed.autostart);
+        assert!(!legacy.autostart);
         assert_eq!((legacy.speed, legacy.duration), (80, 100));
         let mut c = Config::default();
         c.acceleration = false;
@@ -154,7 +161,8 @@ mod tests {
     #[test]
     fn exclusions_normalize_and_round_trip() {
         let mut c = Config::default();
-        c.exclusions = Config::exclusion_names(" Chrome.EXE\r\nchrome\nD:\\Games\\Game.exe,editor ");
+        c.exclusions =
+            Config::exclusion_names(" Chrome.EXE\r\nchrome\nD:\\Games\\Game.exe,editor ");
         assert_eq!(c.exclusions, vec!["chrome", "game", "editor"]);
         assert_eq!(Config::parse(&c.serialize()).exclusions, c.exclusions);
     }
